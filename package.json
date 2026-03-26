@@ -1,0 +1,12 @@
+{
+  "name": "code-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Notion Code Dashboard updater",
+  "scripts": {
+    "dashboard:update": "node scripts/notionDashboardUpdate.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
