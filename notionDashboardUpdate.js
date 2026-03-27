@@ -2,11 +2,12 @@
 /**
  * notionDashboardUpdate.js
  *
- * Reads the @Mar 25 Code Dashboard database from Notion, groups rows by
+ * Reads the Code Dashboard database from Notion, groups rows by
  * Status and Priority, and writes a deterministic summary into the
  * DASHBOARD_SUMMARY markers on the parent page.
  *
  * Usage:  node scripts/notionDashboardUpdate.js
+ *         node scripts/notionDashboardUpdate.js --dry-run
  *         npm run dashboard:update
  *
  * Environment:
@@ -14,25 +15,79 @@
  *   NOTION_API_BASE     (default: https://api.notion.com)
  *   NOTION_VERSION      (default: 2022-06-28)
  *   DASHBOARD_PAGE_ID   (default: fd9255fc8f448343899e817c22804e09)
+ *   DASHBOARD_DB_ID     (default: 79bd524b-0563-4d19-8696-2c706a55a704)
  */
 
+const DRY_RUN = process.argv.includes("--dry-run");
 const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const NOTION_API_BASE = process.env.NOTION_API_BASE || "https://api.notion.com";
 const NOTION_VERSION = process.env.NOTION_VERSION || "2022-06-28";
 const PAGE_ID = (
   process.env.DASHBOARD_PAGE_ID || "fd9255fc8f448343899e817c22804e09"
 ).replace(/-/g, "");
-const DATABASE_ID = "79bd524b-0563-4d19-8696-2c706a55a704";
+const DATABASE_ID =
+  process.env.DASHBOARD_DB_ID || "79bd524b-0563-4d19-8696-2c706a55a704";
 
-if (!NOTION_TOKEN) {
+if (!NOTION_TOKEN && !DRY_RUN) {
   console.error("NOTION_TOKEN is not set. Aborting.");
   process.exit(1);
 }
 
+// ── Lock file to prevent concurrent runs ──────────────────────────────
+
+const fs = await import("node:fs");
+const path = await import("node:path");
+const LOCK_FILE = path.join(
+  process.env.TMPDIR || "/tmp",
+  "notion-dashboard-update.lock"
+);
+
+function acquireLock() {
+  try {
+    fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: "wx" });
+    return true;
+  } catch (e) {
+    if (e.code !== "EEXIST") throw e;
+    // Check if the process holding the lock is still alive
+    try {
+      const pid = parseInt(fs.readFileSync(LOCK_FILE, "utf8"), 10);
+      process.kill(pid, 0); // throws if process doesn't exist
+      return false; // process is alive — lock is valid
+    } catch {
+      // Stale lock — previous run crashed
+      fs.unlinkSync(LOCK_FILE);
+      fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: "wx" });
+      return true;
+    }
+  }
+}
+
+function releaseLock() {
+  try {
+    fs.unlinkSync(LOCK_FILE);
+  } catch {}
+}
+
+if (!DRY_RUN) {
+  if (!acquireLock()) {
+    console.log("Another dashboard update is already running. Skipping.");
+    process.exit(0);
+  }
+  process.on("exit", releaseLock);
+  process.on("SIGINT", () => {
+    releaseLock();
+    process.exit(1);
+  });
+  process.on("SIGTERM", () => {
+    releaseLock();
+    process.exit(1);
+  });
+}
+
 // ── Notion API helpers ────────────────────────────────────────────────
 
-async function notionFetch(path, opts = {}) {
-  const url = `${NOTION_API_BASE}${path}`;
+async function notionFetch(apiPath, opts = {}) {
+  const url = `${NOTION_API_BASE}${apiPath}`;
   const res = await fetch(url, {
     ...opts,
     headers: {
@@ -44,7 +99,7 @@ async function notionFetch(path, opts = {}) {
   });
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Notion API ${res.status} ${path}: ${body}`);
+    throw new Error(`Notion API ${res.status} ${apiPath}: ${body}`);
   }
   return res.json();
 }
@@ -81,16 +136,6 @@ async function deleteBlock(blockId) {
   await notionFetch(`/v1/blocks/${blockId}`, { method: "DELETE" });
 }
 
-async function appendChildren(blockId, children) {
-  // Notion allows max 100 blocks per append call
-  for (let i = 0; i < children.length; i += 100) {
-    await notionFetch(`/v1/blocks/${blockId}/children`, {
-      method: "PATCH",
-      body: JSON.stringify({ children: children.slice(i, i + 100) }),
-    });
-  }
-}
-
 // ── Extract plain text from rich_text arrays ──────────────────────────
 
 function plainText(richTextArr) {
@@ -118,7 +163,10 @@ function extractRow(page) {
   const priority = p.Priority?.select?.name || "No Priority";
   const projectTag = p["Project Tag"]?.select?.name || "";
   const type = p.Type?.select?.name || "";
-  const followUp = p["Follow Up Needed"]?.checkbox === true;
+  const followUpProp = p["Follow Up Needed"];
+  const followUp =
+    followUpProp?.checkbox === true ||
+    followUpProp?.type === "checkbox" && followUpProp.checkbox === true;
   return { title, status, priority, projectTag, type, followUp };
 }
 
@@ -252,19 +300,13 @@ function parseLine(line) {
 function linesToBlocks(lines) {
   const blocks = [];
   for (const line of lines) {
-    if (line === "") {
-      // skip empty lines — spacing is implicit between blocks
-      continue;
-    }
+    if (line === "") continue;
     blocks.push(parseLine(line));
   }
   return blocks;
 }
 
 // ── Find the marker blocks among children ─────────────────────────────
-
-const START_MARKER = "<!-- DASHBOARD_SUMMARY:START -->";
-const END_MARKER = "<!-- DASHBOARD_SUMMARY:END -->";
 
 function findMarkers(blocks) {
   let startIdx = -1;
@@ -303,79 +345,70 @@ async function findSummaryParent(pageId) {
     }
   }
 
-  // Strategy 3: Markers don't exist. Find the database block and insert
-  // markers directly above it at the top level.
-  const dbIdx = topBlocks.findIndex(
-    (b) =>
-      b.type === "child_database" &&
-      b.id.replace(/-/g, "") === DATABASE_ID.replace(/-/g, "")
-  );
-  if (dbIdx !== -1) {
-    return { parentId: pageId, blocks: topBlocks, dbIdx, needsInsert: true };
-  }
-
+  // Strategy 3: Markers don't exist — abort safely
   throw new Error(
-    "Could not find DASHBOARD_SUMMARY markers or the database block on the page."
+    "Could not find DASHBOARD_SUMMARY markers on the page. " +
+      "Add <!-- DASHBOARD_SUMMARY:START --> and <!-- DASHBOARD_SUMMARY:END --> " +
+      "markers above the database block and re-run."
   );
 }
 
 // ── Main ──────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log("Fetching database rows...");
-  const pages = await queryDatabase(DATABASE_ID);
-  console.log(`  Found ${pages.length} rows.`);
+  console.log(DRY_RUN ? "[DRY RUN] " : "", "Fetching database rows...");
+  const pages = DRY_RUN ? [] : await queryDatabase(DATABASE_ID);
 
+  if (DRY_RUN) {
+    // Generate sample output for testing
+    const sampleRows = [
+      { title: "Sample task", status: "In Progress", priority: "High", projectTag: "Test", type: "Feature", followUp: true },
+      { title: "Sample closed", status: "Closed", priority: "Med", projectTag: "Test", type: "Bug Fix", followUp: false },
+    ];
+    const lines = renderSummary(sampleRows);
+    console.log("\n--- DRY RUN OUTPUT ---");
+    lines.forEach((l) => console.log(l));
+    console.log("--- END ---\n");
+    console.log(`Would produce ${linesToBlocks(lines).length} Notion blocks.`);
+    return;
+  }
+
+  console.log(`  Found ${pages.length} rows.`);
   const rows = pages.map(extractRow);
   const summaryLines = renderSummary(rows);
   const summaryBlocks = linesToBlocks(summaryLines);
 
   console.log("Locating summary markers on page...");
   const loc = await findSummaryParent(PAGE_ID);
-
-  if (loc.needsInsert) {
-    // Markers don't exist yet — we cannot easily insert "before" a block
-    // in Notion API without using the "after" parameter relative to the
-    // block before the database block.  Instead, append a toggle above.
-    console.log(
-      "  Markers not found. Cannot insert without restructuring. Aborting safely."
-    );
-    console.log(
-      "  Add the markers manually above the database block and re-run."
-    );
-    process.exit(1);
-  }
-
   const { parentId, blocks, startIdx, endIdx } = loc;
 
   // Delete all blocks between START and END (exclusive of markers)
   const toDelete = blocks.slice(startIdx + 1, endIdx);
-  console.log(
-    `  Deleting ${toDelete.length} old blocks between markers...`
-  );
-  for (const block of toDelete) {
-    await deleteBlock(block.id);
+  console.log(`  Deleting ${toDelete.length} old blocks between markers...`);
+
+  // Parallel delete — Notion handles concurrent block deletes fine
+  const DELETE_BATCH = 10;
+  for (let i = 0; i < toDelete.length; i += DELETE_BATCH) {
+    await Promise.all(
+      toDelete.slice(i, i + DELETE_BATCH).map((block) => deleteBlock(block.id))
+    );
   }
 
-  // Append new summary blocks after the START marker.
-  // Notion's append API puts children at the end of the parent.
-  // We need to use the "after" parameter to insert after the START marker.
+  // Insert new summary blocks after the START marker
   console.log(`  Inserting ${summaryBlocks.length} new summary blocks...`);
 
-  // Notion PATCH /blocks/{id}/children supports "after" to position blocks
+  // Track the last inserted block ID for multi-batch ordering
+  let afterId = blocks[startIdx].id;
   for (let i = 0; i < summaryBlocks.length; i += 100) {
     const batch = summaryBlocks.slice(i, i + 100);
-    const body = {
-      children: batch,
-      after: i === 0 ? blocks[startIdx].id : undefined,
-    };
-    // For subsequent batches, we don't know the new block IDs without
-    // re-reading, so we only use "after" for the first batch.
-    // For a typical dashboard summary this fits in one batch.
-    await notionFetch(`/v1/blocks/${parentId}/children`, {
+    const result = await notionFetch(`/v1/blocks/${parentId}/children`, {
       method: "PATCH",
-      body: JSON.stringify(body),
+      body: JSON.stringify({ children: batch, after: afterId }),
     });
+    // Use the last block from this batch as the anchor for the next
+    if (result.results && result.results.length > 0) {
+      afterId = result.results[result.results.length - 1].id;
+    }
   }
 
   console.log("Dashboard updated successfully.");

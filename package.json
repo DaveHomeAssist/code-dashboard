@@ -2,9 +2,11 @@
   "name": "code-dashboard",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "description": "Notion Code Dashboard updater",
   "scripts": {
-    "dashboard:update": "node scripts/notionDashboardUpdate.js"
+    "dashboard:update": "node scripts/notionDashboardUpdate.js",
+    "dashboard:dry-run": "node scripts/notionDashboardUpdate.js --dry-run"
   },
   "engines": {
     "node": ">=18.0.0"
