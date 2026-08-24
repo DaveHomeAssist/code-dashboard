@@ -36,6 +36,20 @@ node notionDashboardUpdate.js --dry-run  # print a sample summary, no API calls
 
 In production, the script runs unattended via the `Update Notion Dashboard` GitHub Actions workflow, which needs a `NOTION_TOKEN` secret configured on the repo.
 
+## Related documents
+
+This repo drives the Notion Code Dashboard page, which makes it one artifact in a
+longer lineage of cross-project dashboards. That lineage was audited on
+2026-08-18:
+
+| Document | What it covers |
+|---|---|
+| [`docs/ops-hub-v2/AUDIT-2026-08-18.md`](docs/ops-hub-v2/AUDIT-2026-08-18.md) | Read-only audit of every historical dashboard, command center, manifest, and public portfolio surface, with each artifact classified preserve / migrate / archive / unlink / remove-from-public |
+| [`docs/ops-hub-v2/OPS_HUB_V2_SPEC.md`](docs/ops-hub-v2/OPS_HUB_V2_SPEC.md) | Build spec for the consolidated replacement: registry schema, state contract, enforced invariants, and acceptance criteria |
+
+Both are public-safe by construction and cite only already-public evidence. The
+Ops Hub v2 implementation itself belongs in a private repo — see §11 of the spec.
+
 ## License
 
 All rights reserved — see [LICENSE](LICENSE).
